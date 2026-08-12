@@ -4,7 +4,6 @@ import io
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication,
-    QMainWindow,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -135,15 +134,12 @@ class ConversionWorker(QThread):
         self.should_stop = True
 
 
-class CoverConverterGUI(QMainWindow):
+class CoverConverterGUI(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Cover Art Converter")
-        self.setGeometry(100, 100, 600, 500)
 
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
+        main_layout = QVBoxLayout(self)
 
         self.folder_label = QLabel("No folder selected")
         self.folder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
