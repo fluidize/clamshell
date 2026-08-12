@@ -1,5 +1,5 @@
 import sys
-import os
+import io
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication,
@@ -12,8 +12,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QProgressBar,
 )
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QPixmap, QPainter
+from PIL import Image
 from mutagen.flac import FLAC
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, ID3NoHeaderError
@@ -56,6 +59,25 @@ def read_track_metadata(file_path, cache):
     return meta
 
 
+def extract_art(file_path):
+    try:
+        if file_path.suffix.lower() == ".flac":
+            audio = FLAC(file_path)
+            if audio.pictures:
+                return Image.open(io.BytesIO(audio.pictures[0].data))
+        elif file_path.suffix.lower() == ".mp3":
+            try:
+                tags = ID3(file_path)
+            except ID3NoHeaderError:
+                return None
+            for key in tags.keys():
+                if key.startswith("APIC:"):
+                    return Image.open(io.BytesIO(tags[key].data))
+    except Exception:
+        pass
+    return None
+
+
 class TrackLoadWorker(QThread):
     loaded_signal = Signal(str, object)
 
@@ -86,6 +108,123 @@ class TrackLoadWorker(QThread):
         self.loaded_signal.emit(self.album_path, entries)
 
 
+class ApplyWorker(QThread):
+    progress_signal = Signal(int, int)
+    updated_signal = Signal(int, object, object)
+    error_signal = Signal(str)
+    finished_signal = Signal()
+
+    def __init__(self, file_paths, album_title, cache):
+        super().__init__()
+        self.file_paths = file_paths
+        self.album_title = album_title
+        self._cache = cache
+
+    def run(self):
+        total = len(self.file_paths)
+        for index, file_path in enumerate(self.file_paths):
+            new_track_number = str(index + 1)
+            try:
+                if file_path.suffix.lower() == ".flac":
+                    self.update_flac_metadata(
+                        file_path,
+                        new_track_number,
+                        self.album_title if self.album_title else None,
+                    )
+                elif file_path.suffix.lower() == ".mp3":
+                    self.update_mp3_metadata(
+                        file_path,
+                        new_track_number,
+                        self.album_title if self.album_title else None,
+                    )
+
+                new_path = self.rename_file(file_path, new_track_number)
+                new_title = read_track_metadata(new_path, self._cache)["title"]
+                self.updated_signal.emit(index, new_title, str(new_path))
+            except Exception as e:
+                self.error_signal.emit(f"Error processing {file_path.name}: {e}")
+            self.progress_signal.emit(index + 1, total)
+        self.finished_signal.emit()
+
+    def update_flac_metadata(self, file_path, track_number, album_title):
+        audio = FLAC(file_path)
+        audio["tracknumber"] = track_number
+        if album_title:
+            audio["album"] = album_title
+        audio.save()
+
+    def update_mp3_metadata(self, file_path, track_number, album_title):
+        try:
+            audio = MP3(file_path)
+        except ID3NoHeaderError:
+            audio = MP3(file_path)
+            audio.add_tags()
+
+        audio["TRCK"] = TRCK(encoding=3, text=track_number)
+
+        if album_title:
+            audio["TALB"] = TALB(encoding=3, text=album_title)
+
+        audio.save()
+
+    def rename_file(self, file_path, track_number):
+        try:
+            if file_path.suffix.lower() == ".flac":
+                audio = FLAC(file_path)
+                title = audio.get("title", [file_path.stem])[0]
+            elif file_path.suffix.lower() == ".mp3":
+                audio = MP3(file_path)
+                try:
+                    title = (
+                        str(audio["TIT2"][0]) if "TIT2" in audio else file_path.stem
+                    )
+                except (KeyError, IndexError):
+                    title = file_path.stem
+            else:
+                title = file_path.stem
+        except Exception:
+            title = file_path.stem
+
+        invalid_chars = '<>:"/\\|?*'
+        for char in invalid_chars:
+            title = title.replace(char, "")
+
+        new_name = f"{track_number} - {title}{file_path.suffix}"
+        new_path = file_path.parent / new_name
+
+        if new_path != file_path:
+            file_path.rename(new_path)
+            return new_path
+        return file_path
+
+
+class ArtListWidget(QListWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._art = QPixmap()
+
+    def set_art(self, pixmap):
+        self._art = QPixmap(pixmap) if not pixmap.isNull() else QPixmap()
+        self.update()
+
+    def paintEvent(self, event):
+        if not self._art.isNull():
+            painter = QPainter(self.viewport())
+            painter.setOpacity(0.25)
+            scaled = self._art.scaled(
+                self.viewport().size(),
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            painter.drawPixmap(
+                (self.viewport().width() - scaled.width()) // 2,
+                (self.viewport().height() - scaled.height()) // 2,
+                scaled,
+            )
+            painter.end()
+        super().paintEvent(event)
+
+
 class AudioFileReader(QWidget):
     def __init__(self):
         super().__init__()
@@ -103,16 +242,24 @@ class AudioFileReader(QWidget):
 
         panels_layout = QHBoxLayout()
 
+        left_panel = QVBoxLayout()
         self.album_list = QListWidget()
         self.album_list.itemSelectionChanged.connect(self.album_selected)
-        panels_layout.addWidget(self.album_list, 1)
+        left_panel.addWidget(self.album_list, 1)
+        panels_layout.addLayout(left_panel, 1)
 
-        self.file_list = QListWidget()
+        self.file_list = ArtListWidget()
         self.file_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self.file_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.file_list.viewport().setAutoFillBackground(False)
         panels_layout.addWidget(self.file_list, 2)
 
         main_layout.addLayout(panels_layout)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
 
         bottom_layout = QHBoxLayout()
 
@@ -133,6 +280,7 @@ class AudioFileReader(QWidget):
         self.current_album = None
         self._meta_cache = {}
         self.track_worker = None
+        self.apply_worker = None
 
     def select_folder(self):
         folder_path = QFileDialog.getExistingDirectory(self, "Select Music Folder")
@@ -147,6 +295,8 @@ class AudioFileReader(QWidget):
         self.current_album = None
         self._meta_cache.clear()
         self.apply_btn.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        self._clear_art()
 
         root = Path(folder_path)
         audio_extensions = {".flac", ".mp3"}
@@ -179,7 +329,32 @@ class AudioFileReader(QWidget):
         album_path = Path(selected[0].data(Qt.ItemDataRole.UserRole))
         self.current_album = album_path
         self.apply_btn.setEnabled(True)
+        self.load_album_art(album_path)
         self.start_track_load(album_path)
+
+    def load_album_art(self, album_path):
+        self._clear_art()
+
+        folder = Path(album_path)
+        for file in sorted(folder.iterdir()):
+            if file.is_file() and file.suffix.lower() in {".flac", ".mp3"}:
+                img = extract_art(file)
+                if img:
+                    self.display_art(img)
+                    return
+
+    def display_art(self, img):
+        try:
+            buffer = io.BytesIO()
+            img.convert("RGB").save(buffer, format="PNG")
+            pixmap = QPixmap()
+            pixmap.loadFromData(buffer.getvalue())
+            self.file_list.set_art(pixmap)
+        except Exception:
+            self._clear_art()
+
+    def _clear_art(self):
+        self.file_list.set_art(QPixmap())
 
     def start_track_load(self, album_path):
         self.file_list.clear()
@@ -198,6 +373,8 @@ class AudioFileReader(QWidget):
     def _cleanup_worker(self, worker):
         if self.track_worker is worker:
             self.track_worker = None
+        if self.apply_worker is worker:
+            self.apply_worker = None
         worker.deleteLater()
 
     def on_tracks_loaded(self, album_path, entries):
@@ -224,92 +401,51 @@ class AudioFileReader(QWidget):
         return album_path.name
 
     def apply_changes(self):
-        if not self.current_album:
+        if not self.current_album or self.apply_worker is not None:
             return
 
         album_title = self.album_input.text().strip()
 
+        file_paths = []
         for index in range(self.file_list.count()):
             item = self.file_list.item(index)
             file_path_data = item.data(Qt.ItemDataRole.UserRole)
-            if not file_path_data:
-                continue
-            file_path = Path(file_path_data)
-            new_track_number = str(index + 1)
+            if file_path_data:
+                file_paths.append(Path(file_path_data))
 
-            try:
-                if file_path.suffix.lower() == ".flac":
-                    self.update_flac_metadata(
-                        file_path,
-                        new_track_number,
-                        album_title if album_title else None,
-                    )
-                elif file_path.suffix.lower() == ".mp3":
-                    self.update_mp3_metadata(
-                        file_path,
-                        new_track_number,
-                        album_title if album_title else None,
-                    )
+        if not file_paths:
+            return
 
-                new_path = self.rename_file(file_path, new_track_number)
+        self.apply_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
 
-                new_title = read_track_metadata(new_path, self._meta_cache)["title"]
-                item.setText(new_title)
-                item.setData(Qt.ItemDataRole.UserRole, str(new_path))
+        worker = ApplyWorker(file_paths, album_title, self._meta_cache)
+        worker.progress_signal.connect(self.update_progress)
+        worker.updated_signal.connect(self.on_track_updated)
+        worker.error_signal.connect(self.on_apply_error)
+        worker.finished_signal.connect(self.on_apply_finished)
+        worker.finished.connect(lambda w=worker: self._cleanup_worker(w))
+        self.apply_worker = worker
+        worker.start()
 
-            except Exception as e:
-                print(f"Error processing {file_path.name}: {e}")
+    def update_progress(self, current, total):
+        self.progress_bar.setMaximum(max(total, 1))
+        self.progress_bar.setValue(current)
 
+    def on_track_updated(self, index, new_title, new_path):
+        item = self.file_list.item(index)
+        if item:
+            item.setText(new_title)
+            item.setData(Qt.ItemDataRole.UserRole, new_path)
+
+    def on_apply_error(self, message):
+        print(message)
+
+    def on_apply_finished(self):
+        self.apply_btn.setEnabled(True)
+        self.progress_bar.setValue(self.progress_bar.maximum())
         self.start_track_load(self.current_album)
-
-    def update_flac_metadata(self, file_path, track_number, album_title):
-        audio = FLAC(file_path)
-        audio["tracknumber"] = track_number
-        if album_title:
-            audio["album"] = album_title
-        audio.save()
-
-    def update_mp3_metadata(self, file_path, track_number, album_title):
-        try:
-            audio = MP3(file_path)
-        except ID3NoHeaderError:
-            audio = MP3(file_path)
-            audio.add_tags()
-
-        audio["TRCK"] = TRCK(encoding=3, text=track_number)
-
-        if album_title:
-            audio["TALB"] = TALB(encoding=3, text=album_title)
-
-        audio.save()
-
-    def rename_file(self, file_path, track_number):
-        try:
-            if file_path.suffix.lower() == ".flac":
-                audio = FLAC(file_path)
-                title = audio.get("title", [file_path.stem])[0]
-            elif file_path.suffix.lower() == ".mp3":
-                audio = MP3(file_path)
-                try:
-                    title = str(audio["TIT2"][0]) if "TIT2" in audio else file_path.stem
-                except (KeyError, IndexError):
-                    title = file_path.stem
-            else:
-                title = file_path.stem
-        except Exception:
-            title = file_path.stem
-
-        invalid_chars = '<>:"/\\|?*'
-        for char in invalid_chars:
-            title = title.replace(char, "")
-
-        new_name = f"{track_number} - {title}{file_path.suffix}"
-        new_path = file_path.parent / new_name
-
-        if new_path != file_path:
-            file_path.rename(new_path)
-            return new_path
-        return file_path
 
 
 def main():

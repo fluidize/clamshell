@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QLabel,
     QTextEdit,
+    QSpinBox,
+    QProgressBar,
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from PIL import Image
@@ -20,25 +22,33 @@ from mutagen.flac import FLAC, Picture
 
 class ConversionWorker(QThread):
     log_signal = Signal(str)
+    progress_signal = Signal(int, int)
     finished_signal = Signal()
 
-    def __init__(self, folder_path):
+    def __init__(self, folder_path, quality=100):
         super().__init__()
         self.folder_path = folder_path
+        self.quality = quality
         self.should_stop = False
 
     def run(self):
+        audio_files = []
         for root, dirs, files in os.walk(self.folder_path):
+            for file in files:
+                if file.lower().endswith(".mp3"):
+                    audio_files.append((os.path.join(root, file), "mp3"))
+                elif file.lower().endswith(".flac"):
+                    audio_files.append((os.path.join(root, file), "flac"))
+
+        total = len(audio_files)
+        for index, (full_path, kind) in enumerate(audio_files, start=1):
             if self.should_stop:
                 break
-            for file in files:
-                if self.should_stop:
-                    break
-                full_path = os.path.join(root, file)
-                if file.lower().endswith(".mp3"):
-                    self.convert_png_to_jpeg_mp3(full_path)
-                elif file.lower().endswith(".flac"):
-                    self.convert_png_to_jpeg_flac(full_path)
+            if kind == "mp3":
+                self.convert_png_to_jpeg_mp3(full_path)
+            elif kind == "flac":
+                self.convert_png_to_jpeg_flac(full_path)
+            self.progress_signal.emit(index, total)
         self.finished_signal.emit()
 
     def convert_png_to_jpeg_mp3(self, file_path):
@@ -63,7 +73,12 @@ class ConversionWorker(QThread):
                             img = img.convert("RGB")
 
                         output_buffer = io.BytesIO()
-                        img.save(output_buffer, format="JPEG", quality=90)
+                        img.save(
+                            output_buffer,
+                            format="JPEG",
+                            quality=self.quality,
+                            subsampling=0,
+                        )
                         jpeg_data = output_buffer.getvalue()
 
                         apic.mime = "image/jpeg"
@@ -100,7 +115,12 @@ class ConversionWorker(QThread):
                         img = img.convert("RGB")
 
                     output_buffer = io.BytesIO()
-                    img.save(output_buffer, format="JPEG", quality=90)
+                    img.save(
+                        output_buffer,
+                        format="JPEG",
+                        quality=self.quality,
+                        subsampling=0,
+                    )
                     jpeg_data = output_buffer.getvalue()
 
                     new_pic = Picture()
@@ -151,12 +171,28 @@ class CoverConverterGUI(QWidget):
         self.select_folder_btn.clicked.connect(self.select_folder)
         button_layout.addWidget(self.select_folder_btn)
 
+        quality_label = QLabel("JPEG Quality:")
+        button_layout.addWidget(quality_label)
+
+        self.quality_spin = QSpinBox()
+        self.quality_spin.setRange(1, 100)
+        self.quality_spin.setValue(100)
+        self.quality_spin.setToolTip(
+            "JPEG is lossy; 100 with no subsampling is the highest quality"
+        )
+        button_layout.addWidget(self.quality_spin)
+
         self.convert_btn = QPushButton("Convert Covers")
         self.convert_btn.clicked.connect(self.start_conversion)
         self.convert_btn.setEnabled(False)
         button_layout.addWidget(self.convert_btn)
 
         main_layout.addLayout(button_layout)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
 
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
@@ -179,12 +215,22 @@ class CoverConverterGUI(QWidget):
 
         self.convert_btn.setEnabled(False)
         self.select_folder_btn.setEnabled(False)
+        self.quality_spin.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
         self.output_text.append("Starting conversion...")
 
-        self.worker = ConversionWorker(self.current_folder)
+        self.worker = ConversionWorker(
+            self.current_folder, self.quality_spin.value()
+        )
         self.worker.log_signal.connect(self.append_log)
+        self.worker.progress_signal.connect(self.update_progress)
         self.worker.finished_signal.connect(self.conversion_finished)
         self.worker.start()
+
+    def update_progress(self, current, total):
+        self.progress_bar.setMaximum(max(total, 1))
+        self.progress_bar.setValue(current)
 
     def append_log(self, message):
         self.output_text.append(message)
@@ -192,6 +238,7 @@ class CoverConverterGUI(QWidget):
     def conversion_finished(self):
         self.convert_btn.setEnabled(True)
         self.select_folder_btn.setEnabled(True)
+        self.quality_spin.setEnabled(True)
         self.output_text.append("Conversion completed!")
         self.worker = None
 
