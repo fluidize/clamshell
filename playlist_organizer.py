@@ -1,5 +1,6 @@
 import sys
 import io
+import shutil
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication,
@@ -13,6 +14,10 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QProgressBar,
+    QDialog,
+    QDialogButtonBox,
+    QMessageBox,
+    QAbstractItemView,
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QPixmap, QPainter
@@ -225,6 +230,77 @@ class ArtListWidget(QListWidget):
         super().paintEvent(event)
 
 
+class AddToPlaylistDialog(QDialog):
+    def __init__(self, root_path, current_album, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Songs to Playlist")
+        self.root_path = Path(root_path)
+        self.current_album = Path(current_album)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel("Select a playlist (folder), or type a new name:")
+        )
+
+        self.playlist_list = QListWidget()
+        self.playlist_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self._populate_playlists()
+        self.playlist_list.itemSelectionChanged.connect(self._on_list_selection)
+        layout.addWidget(self.playlist_list, 1)
+
+        self.new_name = QLineEdit()
+        self.new_name.setPlaceholderText("New playlist (folder) name")
+        self.new_name.textChanged.connect(self._on_name_changed)
+        layout.addWidget(self.new_name)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._target = None
+
+    def _populate_playlists(self):
+        audio_extensions = {".flac", ".mp3"}
+        for subdir in sorted(self.root_path.iterdir(), key=lambda p: p.name.lower()):
+            if not subdir.is_dir():
+                continue
+            if subdir == self.current_album:
+                continue
+            has_audio = any(
+                f.is_file() and f.suffix.lower() in audio_extensions
+                for f in subdir.iterdir()
+            )
+            item = QListWidgetItem(subdir.name)
+            item.setData(Qt.ItemDataRole.UserRole, str(subdir))
+            item.setFlags(
+                item.flags() & ~Qt.ItemFlag.ItemIsEnabled
+                if not has_audio
+                else item.flags()
+            )
+            self.playlist_list.addItem(item)
+
+    def _on_list_selection(self):
+        selected = self.playlist_list.selectedItems()
+        if selected:
+            self._target = Path(selected[0].data(Qt.ItemDataRole.UserRole))
+            self.new_name.clear()
+
+    def _on_name_changed(self, text):
+        if text.strip():
+            self._target = self.root_path / text.strip()
+        else:
+            self._target = None
+
+    def target(self):
+        return self._target
+
+
 class AudioFileReader(QWidget):
     def __init__(self):
         super().__init__()
@@ -251,6 +327,9 @@ class AudioFileReader(QWidget):
         self.file_list = ArtListWidget()
         self.file_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self.file_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.file_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         self.file_list.viewport().setAutoFillBackground(False)
         panels_layout.addWidget(self.file_list, 2)
 
@@ -269,6 +348,11 @@ class AudioFileReader(QWidget):
         self.album_input = QLineEdit()
         self.album_input.setPlaceholderText("Enter album title")
         bottom_layout.addWidget(self.album_input, 1)
+
+        self.add_btn = QPushButton("Add to Playlist...")
+        self.add_btn.clicked.connect(self.add_to_playlist)
+        self.add_btn.setEnabled(False)
+        bottom_layout.addWidget(self.add_btn)
 
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.clicked.connect(self.apply_changes)
@@ -295,6 +379,7 @@ class AudioFileReader(QWidget):
         self.current_album = None
         self._meta_cache.clear()
         self.apply_btn.setEnabled(False)
+        self.add_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
         self._clear_art()
 
@@ -329,6 +414,7 @@ class AudioFileReader(QWidget):
         album_path = Path(selected[0].data(Qt.ItemDataRole.UserRole))
         self.current_album = album_path
         self.apply_btn.setEnabled(True)
+        self.add_btn.setEnabled(True)
         self.load_album_art(album_path)
         self.start_track_load(album_path)
 
@@ -399,6 +485,59 @@ class AudioFileReader(QWidget):
             if meta["album"]:
                 return meta["album"]
         return album_path.name
+
+    def add_to_playlist(self):
+        if not self.current_album or self.apply_worker is not None:
+            return
+
+        selected = self.file_list.selectedItems()
+        if not selected:
+            QMessageBox.information(
+                self, "Add to Playlist", "Select one or more songs to add."
+            )
+            return
+
+        root = self.current_album.parent
+        dialog = AddToPlaylistDialog(root, self.current_album, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        target = dialog.target()
+        if target is None:
+            return
+        if target == self.current_album:
+            QMessageBox.information(
+                self, "Add to Playlist", "Select a different playlist (folder)."
+            )
+            return
+
+        source_paths = [
+            Path(item.data(Qt.ItemDataRole.UserRole))
+            for item in selected
+            if item.data(Qt.ItemDataRole.UserRole)
+        ]
+
+        target.mkdir(parents=True, exist_ok=True)
+        added = 0
+        skipped = 0
+        for source in source_paths:
+            dest = target / source.name
+            if dest.exists():
+                skipped += 1
+                continue
+            try:
+                shutil.copy2(source, dest)
+                added += 1
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Add to Playlist", f"Failed to copy {source.name}: {e}"
+                )
+
+        if added or skipped:
+            msg = f"Added {added} song(s) to '{target.name}'."
+            if skipped:
+                msg += f" {skipped} song(s) already existed and were skipped."
+            QMessageBox.information(self, "Add to Playlist", msg)
 
     def apply_changes(self):
         if not self.current_album or self.apply_worker is not None:
