@@ -127,8 +127,9 @@ class ApplyWorker(QThread):
 
     def run(self):
         total = len(self.file_paths)
+        width = max(2, len(str(total)))
         for index, file_path in enumerate(self.file_paths):
-            new_track_number = str(index + 1)
+            new_track_number = str(index + 1).zfill(width)
             try:
                 if file_path.suffix.lower() == ".flac":
                     self.update_flac_metadata(
