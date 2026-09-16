@@ -3,6 +3,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget
 from theme import apply_theme
 from cover_converter import CoverConverterGUI
 from playlist_organizer import AudioFileReader
+from downsampler import DownsampleGUI
 
 
 class ClamshellGUI(QMainWindow):
@@ -17,6 +18,7 @@ class ClamshellGUI(QMainWindow):
         
         self.tabs.addTab(AudioFileReader(), "Playlist Organizer")
         self.tabs.addTab(CoverConverterGUI(), "Cover Converter")
+        self.tabs.addTab(DownsampleGUI(), "Downsampler")
         self.tabs.tabBar().setExpanding(False)
 
 
