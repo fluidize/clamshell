@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Clamshell
+Comment=Tools for FLAC and MP3 music libraries
+Exec=clamshell-gtk
+Icon=audio-x-generic
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=flac;mp3;music;playlist;cover;art;downsample;clamshell;
+StartupNotify=true

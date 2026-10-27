@@ -1,0 +1,4 @@
+.venv/
+.venv-gtk/
+__pycache__/
+*.py[cod]

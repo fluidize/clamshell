@@ -1,0 +1,5 @@
+# The GTK 4 / libadwaita front end needs PyGObject and GTK from the
+# system (install python3-gi, gir1.2-gtk-4.0 and gir1.2-adw-1 with your
+# package manager). Only the two pure-Python libraries can live in a venv.
+mutagen
+Pillow
